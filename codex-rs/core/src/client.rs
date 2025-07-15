@@ -23,10 +23,10 @@ use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::client_common::ResponsesApiRequest;
 use crate::client_common::create_reasoning_param_for_request;
+use crate::config::Config;
 use crate::config_types::ReasoningEffort as ReasoningEffortConfig;
 use crate::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use crate::error::CodexErr;
-use crate::error::EnvVarError;
 use crate::error::Result;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
 use crate::flags::OPENAI_REQUEST_MAX_RETRIES;
@@ -35,11 +35,13 @@ use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::WireApi;
 use crate::models::ResponseItem;
 use crate::openai_tools::create_tools_json_for_responses_api;
+use crate::protocol::TokenUsage;
 use crate::util::backoff;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct ModelClient {
-    model: String,
+    config: Arc<Config>,
     client: reqwest::Client,
     provider: ModelProviderInfo,
     effort: ReasoningEffortConfig,
@@ -48,13 +50,13 @@ pub struct ModelClient {
 
 impl ModelClient {
     pub fn new(
-        model: impl ToString,
+        config: Arc<Config>,
         provider: ModelProviderInfo,
         effort: ReasoningEffortConfig,
         summary: ReasoningSummaryConfig,
     ) -> Self {
         Self {
-            model: model.to_string(),
+            config,
             client: reqwest::Client::new(),
             provider,
             effort,
@@ -70,9 +72,13 @@ impl ModelClient {
             WireApi::Responses => self.stream_responses(prompt).await,
             WireApi::Chat => {
                 // Create the raw streaming connection first.
-                let response_stream =
-                    stream_chat_completions(prompt, &self.model, &self.client, &self.provider)
-                        .await?;
+                let response_stream = stream_chat_completions(
+                    prompt,
+                    &self.config.model,
+                    &self.client,
+                    &self.provider,
+                )
+                .await?;
 
                 // Wrap it with the aggregation adapter so callers see *only*
                 // the final assistant message per turn (matching the
@@ -106,11 +112,11 @@ impl ModelClient {
             return stream_from_fixture(path).await;
         }
 
-        let full_instructions = prompt.get_full_instructions(&self.model);
-        let tools_json = create_tools_json_for_responses_api(prompt, &self.model)?;
-        let reasoning = create_reasoning_param_for_request(&self.model, self.effort, self.summary);
+        let full_instructions = prompt.get_full_instructions(&self.config.model);
+        let tools_json = create_tools_json_for_responses_api(prompt, &self.config.model)?;
+        let reasoning = create_reasoning_param_for_request(&self.config, self.effort, self.summary);
         let payload = ResponsesApiRequest {
-            model: &self.model,
+            model: &self.config.model,
             instructions: &full_instructions,
             input: &prompt.input,
             tools: &tools_json,
@@ -122,30 +128,24 @@ impl ModelClient {
             stream: true,
         };
 
-        let base_url = self.provider.base_url.clone();
-        let base_url = base_url.trim_end_matches('/');
-        let url = format!("{}/responses", base_url);
-        trace!("POST to {url}: {}", serde_json::to_string(&payload)?);
+        trace!(
+            "POST to {}: {}",
+            self.provider.get_full_url(),
+            serde_json::to_string(&payload)?
+        );
 
         let mut attempt = 0;
         loop {
             attempt += 1;
 
-            let api_key = self.provider.api_key()?.ok_or_else(|| {
-                CodexErr::EnvVar(EnvVarError {
-                    var: self.provider.env_key.clone().unwrap_or_default(),
-                    instructions: None,
-                })
-            })?;
-            let res = self
-                .client
-                .post(&url)
-                .bearer_auth(api_key)
+            let req_builder = self
+                .provider
+                .create_request_builder(&self.client)?
                 .header("OpenAI-Beta", "responses=experimental")
                 .header(reqwest::header::ACCEPT, "text/event-stream")
-                .json(&payload)
-                .send()
-                .await;
+                .json(&payload);
+
+            let res = req_builder.send().await;
             match res {
                 Ok(resp) if resp.status().is_success() => {
                     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(16);
@@ -167,7 +167,7 @@ impl ModelClient {
                     // negligible.
                     if !(status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()) {
                         // Surface the error body to callers. Use `unwrap_or_default` per Clippy.
-                        let body = (res.text().await).unwrap_or_default();
+                        let body = res.text().await.unwrap_or_default();
                         return Err(CodexErr::UnexpectedStatus(status, body));
                     }
 
@@ -208,8 +208,43 @@ struct SseEvent {
 }
 
 #[derive(Debug, Deserialize)]
+struct ResponseCreated {}
+
+#[derive(Debug, Deserialize)]
 struct ResponseCompleted {
     id: String,
+    usage: Option<ResponseCompletedUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseCompletedUsage {
+    input_tokens: u64,
+    input_tokens_details: Option<ResponseCompletedInputTokensDetails>,
+    output_tokens: u64,
+    output_tokens_details: Option<ResponseCompletedOutputTokensDetails>,
+    total_tokens: u64,
+}
+
+impl From<ResponseCompletedUsage> for TokenUsage {
+    fn from(val: ResponseCompletedUsage) -> Self {
+        TokenUsage {
+            input_tokens: val.input_tokens,
+            cached_input_tokens: val.input_tokens_details.map(|d| d.cached_tokens),
+            output_tokens: val.output_tokens,
+            reasoning_output_tokens: val.output_tokens_details.map(|d| d.reasoning_tokens),
+            total_tokens: val.total_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseCompletedInputTokensDetails {
+    cached_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseCompletedOutputTokensDetails {
+    reasoning_tokens: u64,
 }
 
 async fn process_sse<S>(stream: S, tx_event: mpsc::Sender<Result<ResponseEvent>>)
@@ -221,7 +256,7 @@ where
     // If the stream stays completely silent for an extended period treat it as disconnected.
     let idle_timeout = *OPENAI_STREAM_IDLE_TIMEOUT_MS;
     // The response id returned from the "complete" message.
-    let mut response_id = None;
+    let mut response_completed: Option<ResponseCompleted> = None;
 
     loop {
         let sse = match timeout(idle_timeout, stream.next()).await {
@@ -233,9 +268,15 @@ where
                 return;
             }
             Ok(None) => {
-                match response_id {
-                    Some(response_id) => {
-                        let event = ResponseEvent::Completed { response_id };
+                match response_completed {
+                    Some(ResponseCompleted {
+                        id: response_id,
+                        usage,
+                    }) => {
+                        let event = ResponseEvent::Completed {
+                            response_id,
+                            token_usage: usage.map(Into::into),
+                        };
                         let _ = tx_event.send(Ok(event)).await;
                     }
                     None => {
@@ -296,12 +337,17 @@ where
                     return;
                 }
             }
+            "response.created" => {
+                if event.response.is_some() {
+                    let _ = tx_event.send(Ok(ResponseEvent::Created {})).await;
+                }
+            }
             // Final response completed – includes array of output items & id
             "response.completed" => {
                 if let Some(resp_val) = event.response {
                     match serde_json::from_value::<ResponseCompleted>(resp_val) {
                         Ok(r) => {
-                            response_id = Some(r.id);
+                            response_completed = Some(r);
                         }
                         Err(e) => {
                             debug!("failed to parse ResponseCompleted: {e}");
@@ -311,7 +357,6 @@ where
                 };
             }
             "response.content_part.done"
-            | "response.created"
             | "response.function_call_arguments.delta"
             | "response.in_progress"
             | "response.output_item.added"
@@ -345,4 +390,242 @@ async fn stream_from_fixture(path: impl AsRef<Path>) -> Result<ResponseStream> {
     let stream = ReaderStream::new(rdr).map_err(CodexErr::Io);
     tokio::spawn(process_sse(stream, tx_event));
     Ok(ResponseStream { rx_event })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+    use tokio_test::io::Builder as IoBuilder;
+    use tokio_util::io::ReaderStream;
+
+    // ────────────────────────────
+    // Helpers
+    // ────────────────────────────
+
+    /// Runs the SSE parser on pre-chunked byte slices and returns every event
+    /// (including any final `Err` from a stream-closure check).
+    async fn collect_events(chunks: &[&[u8]]) -> Vec<Result<ResponseEvent>> {
+        let mut builder = IoBuilder::new();
+        for chunk in chunks {
+            builder.read(chunk);
+        }
+
+        let reader = builder.build();
+        let stream = ReaderStream::new(reader).map_err(CodexErr::Io);
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent>>(16);
+        tokio::spawn(process_sse(stream, tx));
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        events
+    }
+
+    /// Builds an in-memory SSE stream from JSON fixtures and returns only the
+    /// successfully parsed events (panics on internal channel errors).
+    async fn run_sse(events: Vec<serde_json::Value>) -> Vec<ResponseEvent> {
+        let mut body = String::new();
+        for e in events {
+            let kind = e
+                .get("type")
+                .and_then(|v| v.as_str())
+                .expect("fixture event missing type");
+            if e.as_object().map(|o| o.len() == 1).unwrap_or(false) {
+                body.push_str(&format!("event: {kind}\n\n"));
+            } else {
+                body.push_str(&format!("event: {kind}\ndata: {e}\n\n"));
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent>>(8);
+        let stream = ReaderStream::new(std::io::Cursor::new(body)).map_err(CodexErr::Io);
+        tokio::spawn(process_sse(stream, tx));
+
+        let mut out = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            out.push(ev.expect("channel closed"));
+        }
+        out
+    }
+
+    // ────────────────────────────
+    // Tests from `implement-test-for-responses-api-sse-parser`
+    // ────────────────────────────
+
+    #[tokio::test]
+    async fn parses_items_and_completed() {
+        let item1 = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hello"}]
+            }
+        })
+        .to_string();
+
+        let item2 = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "World"}]
+            }
+        })
+        .to_string();
+
+        let completed = json!({
+            "type": "response.completed",
+            "response": { "id": "resp1" }
+        })
+        .to_string();
+
+        let sse1 = format!("event: response.output_item.done\ndata: {item1}\n\n");
+        let sse2 = format!("event: response.output_item.done\ndata: {item2}\n\n");
+        let sse3 = format!("event: response.completed\ndata: {completed}\n\n");
+
+        let events = collect_events(&[sse1.as_bytes(), sse2.as_bytes(), sse3.as_bytes()]).await;
+
+        assert_eq!(events.len(), 3);
+
+        matches!(
+            &events[0],
+            Ok(ResponseEvent::OutputItemDone(ResponseItem::Message { role, .. }))
+                if role == "assistant"
+        );
+
+        matches!(
+            &events[1],
+            Ok(ResponseEvent::OutputItemDone(ResponseItem::Message { role, .. }))
+                if role == "assistant"
+        );
+
+        match &events[2] {
+            Ok(ResponseEvent::Completed {
+                response_id,
+                token_usage,
+            }) => {
+                assert_eq!(response_id, "resp1");
+                assert!(token_usage.is_none());
+            }
+            other => panic!("unexpected third event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn error_when_missing_completed() {
+        let item1 = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hello"}]
+            }
+        })
+        .to_string();
+
+        let sse1 = format!("event: response.output_item.done\ndata: {item1}\n\n");
+
+        let events = collect_events(&[sse1.as_bytes()]).await;
+
+        assert_eq!(events.len(), 2);
+
+        matches!(events[0], Ok(ResponseEvent::OutputItemDone(_)));
+
+        match &events[1] {
+            Err(CodexErr::Stream(msg)) => {
+                assert_eq!(msg, "stream closed before response.completed")
+            }
+            other => panic!("unexpected second event: {other:?}"),
+        }
+    }
+
+    // ────────────────────────────
+    // Table-driven test from `main`
+    // ────────────────────────────
+
+    /// Verifies that the adapter produces the right `ResponseEvent` for a
+    /// variety of incoming `type` values.
+    #[tokio::test]
+    async fn table_driven_event_kinds() {
+        struct TestCase {
+            name: &'static str,
+            event: serde_json::Value,
+            expect_first: fn(&ResponseEvent) -> bool,
+            expected_len: usize,
+        }
+
+        fn is_created(ev: &ResponseEvent) -> bool {
+            matches!(ev, ResponseEvent::Created)
+        }
+        fn is_output(ev: &ResponseEvent) -> bool {
+            matches!(ev, ResponseEvent::OutputItemDone(_))
+        }
+        fn is_completed(ev: &ResponseEvent) -> bool {
+            matches!(ev, ResponseEvent::Completed { .. })
+        }
+
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "c",
+                "usage": {
+                    "input_tokens": 0,
+                    "input_tokens_details": null,
+                    "output_tokens": 0,
+                    "output_tokens_details": null,
+                    "total_tokens": 0
+                },
+                "output": []
+            }
+        });
+
+        let cases = vec![
+            TestCase {
+                name: "created",
+                event: json!({"type": "response.created", "response": {}}),
+                expect_first: is_created,
+                expected_len: 2,
+            },
+            TestCase {
+                name: "output_item.done",
+                event: json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": "hi"}
+                        ]
+                    }
+                }),
+                expect_first: is_output,
+                expected_len: 2,
+            },
+            TestCase {
+                name: "unknown",
+                event: json!({"type": "response.new_tool_event"}),
+                expect_first: is_completed,
+                expected_len: 1,
+            },
+        ];
+
+        for case in cases {
+            let mut evs = vec![case.event];
+            evs.push(completed.clone());
+
+            let out = run_sse(evs).await;
+            assert_eq!(out.len(), case.expected_len, "case {}", case.name);
+            assert!(
+                (case.expect_first)(&out[0]),
+                "first event mismatch in case {}",
+                case.name
+            );
+        }
+    }
 }

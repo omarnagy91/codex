@@ -1,21 +1,23 @@
 //! Bottom pane: shows the ChatComposer or a BottomPaneView, if one is active.
 
+use crate::app_event::AppEvent;
+use crate::app_event_sender::AppEventSender;
+use crate::user_approval_widget::ApprovalRequest;
 use bottom_pane_view::BottomPaneView;
 use bottom_pane_view::ConditionalUpdate;
+use codex_core::protocol::TokenUsage;
+use codex_file_search::FileMatch;
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::WidgetRef;
-
-use crate::app_event::AppEvent;
-use crate::app_event_sender::AppEventSender;
-use crate::user_approval_widget::ApprovalRequest;
 
 mod approval_modal_view;
 mod bottom_pane_view;
 mod chat_composer;
 mod chat_composer_history;
 mod command_popup;
+mod file_search_popup;
 mod status_indicator_view;
 
 pub(crate) use chat_composer::ChatComposer;
@@ -36,6 +38,7 @@ pub(crate) struct BottomPane<'a> {
     app_event_tx: AppEventSender,
     has_input_focus: bool,
     is_task_running: bool,
+    ctrl_c_quit_hint: bool,
 }
 
 pub(crate) struct BottomPaneParams {
@@ -51,6 +54,7 @@ impl BottomPane<'_> {
             app_event_tx: params.app_event_tx,
             has_input_focus: params.has_input_focus,
             is_task_running: false,
+            ctrl_c_quit_hint: false,
         }
     }
 
@@ -78,6 +82,15 @@ impl BottomPane<'_> {
         }
     }
 
+    pub fn handle_paste(&mut self, pasted: String) {
+        if self.active_view.is_none() {
+            let needs_redraw = self.composer.handle_paste(pasted);
+            if needs_redraw {
+                self.request_redraw();
+            }
+        }
+    }
+
     /// Update the status indicator text (only when the `StatusIndicatorView` is
     /// active).
     pub(crate) fn update_status_text(&mut self, text: String) {
@@ -97,6 +110,26 @@ impl BottomPane<'_> {
     pub(crate) fn set_input_focus(&mut self, has_focus: bool) {
         self.has_input_focus = has_focus;
         self.composer.set_input_focus(has_focus);
+    }
+
+    pub(crate) fn show_ctrl_c_quit_hint(&mut self) {
+        self.ctrl_c_quit_hint = true;
+        self.composer
+            .set_ctrl_c_quit_hint(true, self.has_input_focus);
+        self.request_redraw();
+    }
+
+    pub(crate) fn clear_ctrl_c_quit_hint(&mut self) {
+        if self.ctrl_c_quit_hint {
+            self.ctrl_c_quit_hint = false;
+            self.composer
+                .set_ctrl_c_quit_hint(false, self.has_input_focus);
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn ctrl_c_quit_hint_visible(&self) -> bool {
+        self.ctrl_c_quit_hint
     }
 
     pub fn set_task_running(&mut self, running: bool) {
@@ -127,6 +160,22 @@ impl BottomPane<'_> {
                 // No change.
             }
         }
+    }
+
+    pub(crate) fn is_task_running(&self) -> bool {
+        self.is_task_running
+    }
+
+    /// Update the *context-window remaining* indicator in the composer. This
+    /// is forwarded directly to the underlying `ChatComposer`.
+    pub(crate) fn set_token_usage(
+        &mut self,
+        token_usage: TokenUsage,
+        model_context_window: Option<u64>,
+    ) {
+        self.composer
+            .set_token_usage(token_usage, model_context_window);
+        self.request_redraw();
     }
 
     /// Called when the agent requests user approval.
@@ -162,9 +211,9 @@ impl BottomPane<'_> {
         self.app_event_tx.send(AppEvent::Redraw)
     }
 
-    /// Returns true when the slash-command popup inside the composer is visible.
-    pub(crate) fn is_command_popup_visible(&self) -> bool {
-        self.active_view.is_none() && self.composer.is_command_popup_visible()
+    /// Returns true when a popup inside the composer is visible.
+    pub(crate) fn is_popup_visible(&self) -> bool {
+        self.active_view.is_none() && self.composer.is_popup_visible()
     }
 
     // --- History helpers ---
@@ -186,6 +235,11 @@ impl BottomPane<'_> {
         if updated {
             self.request_redraw();
         }
+    }
+
+    pub(crate) fn on_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
+        self.composer.on_file_search_result(query, matches);
+        self.request_redraw();
     }
 }
 
